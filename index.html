@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QMaze - Watch an AI learn to solve a maze</title>
+<style>
+:root{--bg:#0f1720;--panel:#182433;--line:#26364b;--text:#e8eef6;--muted:#8fa3bd;--accent:#ff7a59;--wall:#3b4a5f;--open:#101b28}
+@media (prefers-color-scheme:light){:root{--bg:#eef2f7;--panel:#fff;--line:#d3dce8;--text:#142033;--muted:#5a6d88;--wall:#8497b3;--open:#f6f9fc}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;padding:24px 16px}
+.wrap{max-width:960px;margin:0 auto}
+h1{margin:0;font-size:2rem;letter-spacing:-.02em}
+h1 span{color:var(--accent)}
+.sub{color:var(--muted);margin:6px 0 20px;max-width:60ch;line-height:1.5}
+.layout{display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start}
+canvas{width:100%;max-width:500px;aspect-ratio:1;background:var(--open);border:1px solid var(--line);border-radius:12px;touch-action:none;cursor:crosshair}
+.side{flex:1;min-width:260px;display:flex;flex-direction:column;gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.stats div{font-size:.8rem;color:var(--muted)}
+.stats b{display:block;font-size:1.4rem;color:var(--text);font-variant-numeric:tabular-nums}
+label{display:flex;justify-content:space-between;font-size:.85rem;color:var(--muted);margin-top:10px}
+label output{color:var(--text);font-variant-numeric:tabular-nums}
+input[type=range]{width:100%;accent-color:var(--accent)}
+.btns{display:flex;gap:8px;flex-wrap:wrap}
+button{font:inherit;font-size:.9rem;border:1px solid var(--line);background:var(--bg);color:var(--text);padding:8px 12px;border-radius:8px;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#1a0d08;font-weight:600}
+button:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+.hint{font-size:.8rem;color:var(--muted);line-height:1.5;margin:0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Q<span>Maze</span></h1>
+  <p class="sub">A little mouse starts knowing nothing. Watch it wander, find the cheese, and slowly learn the shortest path home with Q-learning. Draw your own walls and see it adapt.</p>
+  <div class="layout">
+    <canvas id="cv" width="500" height="500" aria-label="Maze grid"></canvas>
+    <div class="side">
+      <div class="card stats">
+        <div>Episodes<b id="sEp">0</b></div>
+        <div>Success (last 50)<b id="sRate">0%</b></div>
+        <div>Last path length<b id="sLen">-</b></div>
+        <div>Exploration (&epsilon;)<b id="sEps">0.50</b></div>
+      </div>
+      <div class="card">
+        <div class="btns">
+          <button class="primary" id="run">Train</button>
+          <button id="reset">Reset learning</button>
+          <button id="rand">Random walls</button>
+          <button id="clear">Clear walls</button>
+        </div>
+        <label style="justify-content:flex-start;align-items:center;gap:8px;color:var(--text)"><input type="checkbox" id="instant" checked>Instant re-plan after edits</label>
+        <label>Speed (moves/sec)<output id="oSpd">4</output></label>
+        <input type="range" id="spd" min="1" max="300" value="4">
+        <label>Learning rate &alpha;<output id="oA">0.50</output></label>
+        <input type="range" id="alpha" min="0.01" max="1" step="0.01" value="0.5">
+        <label>Discount &gamma;<output id="oG">0.95</output></label>
+        <input type="range" id="gamma" min="0.5" max="0.99" step="0.01" value="0.95">
+        <label>Starting exploration &epsilon;<output id="oE">0.50</output></label>
+        <input type="range" id="eps0" min="0" max="1" step="0.05" value="0.5">
+      </div>
+      <p class="hint">Click or drag on the grid to add or remove walls. Teal shading shows how valuable the mouse thinks each cell is, and arrows show its preferred move. The mouse starts at the house and hunts for the cheese. Slow the speed down to follow every step.</p>
+    </div>
+  </div>
+</div>
+<script>
+const W=10,H=10,N=W*H,START=0,GOAL=N-1,MAX_STEPS=200;
+const DX=[0,1,0,-1],DY=[-1,0,1,0],ARROWS=["\u2191","\u2192","\u2193","\u2190"];
+const cv=document.getElementById("cv"),ctx=cv.getContext("2d");
+const $=id=>document.getElementById(id);
+let wall=new Uint8Array(N),Q=new Float32Array(N*4);
+let pos=START,prevPos=START,tick=0,pending=false,steps=0,episode=0,eps=0.5,recent=[],lastLen=null,running=false;
+
+function defaultMaze(){
+  wall.fill(0);
+  [[2,0],[2,1],[2,2],[2,3],[2,4],[5,9],[5,8],[5,7],[5,6],[5,5],[7,2],[7,3],[7,4],[7,5],[7,6],[4,4],[3,4]]
+    .forEach(([x,y])=>wall[y*W+x]=1);
+}
+const best=s=>Math.max(Q[s*4],Q[s*4+1],Q[s*4+2],Q[s*4+3]);
+function argmax(s){
+  let m=best(s),c=[];
+  for(let a=0;a<4;a++)if(Q[s*4+a]===m)c.push(a);
+  return c[Math.floor(Math.random()*c.length)];
+}
+function newEpisode(){pos=START;prevPos=START;steps=0;pending=false}
+function resetLearning(){
+  Q.fill(0);episode=0;recent=[];lastLen=null;eps=+$("eps0").value;newEpisode();
+}
+
+// Re-plan: sweep the Bellman update over every state-action pair using the
+// known maze layout, so Q-values match the edited maze straight away.
+function replan(){
+  const gamma=+$("gamma").value;
+  for(let k=0;k<150;k++){
+    for(let s=0;s<N;s++){
+      if(wall[s]||s===GOAL)continue;
+      for(let a=0;a<4;a++){
+        const x=s%W+DX[a],y=Math.floor(s/W)+DY[a];
+        let ns=s,r=-1,done=false;
+        if(x<0||y<0||x>=W||y>=H||wall[y*W+x])r=-5;else ns=y*W+x;
+        if(ns===GOAL){r=100;done=true}
+        Q[s*4+a]=r+(done?0:gamma*best(ns));
+      }
+    }
+  }
+  eps=Math.min(eps,0.05);
+}
+function afterEdit(wipe){
+  if($("instant").checked&&episode>0){replan();newEpisode()}
+  else if(wipe)resetLearning();
+  else newEpisode();
+}
+
+function stepAgent(){
+  if(pending){newEpisode();return}
+  prevPos=pos;
+  const alpha=+$("alpha").value,gamma=+$("gamma").value;
+  const a=Math.random()<eps?Math.floor(Math.random()*4):argmax(pos);
+  const x=pos%W+DX[a],y=Math.floor(pos/W)+DY[a];
+  let ns=pos,r=-1,done=false;
+  if(x<0||y<0||x>=W||y>=H||wall[y*W+x]){r=-5}
+  else ns=y*W+x;
+  if(ns===GOAL){r=100;done=true}
+  const i=pos*4+a;
+  Q[i]+=alpha*(r+(done?0:gamma*best(ns))-Q[i]);
+  pos=ns;steps++;
+  if(done||steps>=MAX_STEPS){
+    episode++;
+    recent.push(done?1:0);if(recent.length>50)recent.shift();
+    if(done)lastLen=steps;
+    eps=Math.max(0.02,eps*0.99);
+    pending=true;
+  }
+}
+
+function draw(){
+  const cs=cv.width/W,st=getComputedStyle(document.documentElement);
+  const wallC=st.getPropertyValue("--wall"),openC=st.getPropertyValue("--open"),
+        lineC=st.getPropertyValue("--line"),textC=st.getPropertyValue("--text"),acc=st.getPropertyValue("--accent");
+  ctx.clearRect(0,0,cv.width,cv.height);
+  let mx=-Infinity,mn=Infinity;
+  for(let s=0;s<N;s++)if(!wall[s]){const v=best(s);if(v>mx)mx=v;if(v<mn)mn=v}
+  const span=mx-mn;
+  ctx.textAlign="center";ctx.textBaseline="middle";
+  for(let s=0;s<N;s++){
+    const x=(s%W)*cs,y=Math.floor(s/W)*cs;
+    ctx.fillStyle=wall[s]?wallC:openC;ctx.fillRect(x,y,cs,cs);
+    if(!wall[s]&&span>0){
+      ctx.fillStyle="rgba(80,200,190,"+(((best(s)-mn)/span)*0.75).toFixed(3)+")";
+      ctx.fillRect(x,y,cs,cs);
+      ctx.fillStyle=textC;ctx.globalAlpha=0.65;ctx.font=(cs*0.4)+"px system-ui";
+      ctx.fillText(ARROWS[argmaxStable(s)],x+cs/2,y+cs/2);ctx.globalAlpha=1;
+    }
+    ctx.strokeStyle=lineC;ctx.strokeRect(x,y,cs,cs);
+  }
+  ctx.font=(cs*0.6)+"px system-ui,'Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji'";
+  ctx.fillStyle="rgba(62,207,142,0.35)";ctx.fillRect(0,0,cs,cs);
+  ctx.fillText("\u{1F3E0}",cs/2,cs/2);
+  const gx=(GOAL%W)*cs,gy=Math.floor(GOAL/W)*cs;
+  ctx.fillStyle="rgba(245,185,50,0.45)";ctx.fillRect(gx,gy,cs,cs);
+  ctx.fillText("\u{1F9C0}",gx+cs/2,gy+cs/2);
+  let p=running?Math.min(1,tick):1;p=p*p*(3-2*p);
+  const mxp=((prevPos%W)+((pos%W)-(prevPos%W))*p+0.5)*cs;
+  const myp=(Math.floor(prevPos/W)+(Math.floor(pos/W)-Math.floor(prevPos/W))*p+0.5)*cs;
+  ctx.fillText("\u{1F42D}",mxp,myp);
+}
+function argmaxStable(s){let b=0;for(let a=1;a<4;a++)if(Q[s*4+a]>Q[s*4+b])b=a;return b}
+
+function updateStats(){
+  $("sEp").textContent=episode;
+  $("sRate").textContent=recent.length?Math.round(100*recent.reduce((a,b)=>a+b,0)/recent.length)+"%":"0%";
+  $("sLen").textContent=lastLen??"-";
+  $("sEps").textContent=eps.toFixed(2);
+}
+
+let lastT=0;
+function loop(ts){
+  const dt=Math.min(100,ts-(lastT||ts));lastT=ts;
+  if(running){
+    tick+=dt/1000*(+$("spd").value);
+    let n=0;
+    while(tick>=1&&n++<50){stepAgent();tick-=1}
+    tick=Math.min(tick,1);
+  }
+  draw();updateStats();requestAnimationFrame(loop);
+}
+
+// Wall editing
+let paint=null;
+function cellAt(e){
+  const r=cv.getBoundingClientRect();
+  const x=Math.floor((e.clientX-r.left)/r.width*W),y=Math.floor((e.clientY-r.top)/r.height*H);
+  return x<0||y<0||x>=W||y>=H?-1:y*W+x;
+}
+function paintCell(e){
+  const c=cellAt(e);
+  if(c<0||c===START||c===GOAL)return;
+  if(paint===null)paint=wall[c]?0:1;
+  wall[c]=paint;
+}
+cv.addEventListener("pointerdown",e=>{paint=null;cv.setPointerCapture(e.pointerId);paintCell(e)});
+cv.addEventListener("pointermove",e=>{if(e.buttons)paintCell(e)});
+cv.addEventListener("pointerup",()=>{paint=null;afterEdit(false)});
+
+// Controls
+$("run").onclick=()=>{running=!running;$("run").textContent=running?"Pause":"Train"};
+$("reset").onclick=resetLearning;
+$("clear").onclick=()=>{wall.fill(0);afterEdit(true)};
+$("rand").onclick=()=>{
+  for(let s=0;s<N;s++)wall[s]=s!==START&&s!==GOAL&&Math.random()<0.25?1:0;
+  afterEdit(true);
+};
+[["spd","oSpd",0],["alpha","oA",2],["gamma","oG",2],["eps0","oE",2]].forEach(([i,o,d])=>{
+  $(i).addEventListener("input",()=>{
+    $(o).textContent=(+$(i).value).toFixed(d);
+    if(i==="eps0")eps=+$(i).value;
+  });
+});
+
+defaultMaze();resetLearning();requestAnimationFrame(loop);
+</script>
+</body>
+</html>
